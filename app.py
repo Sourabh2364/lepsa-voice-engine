@@ -1,6 +1,9 @@
 import gc
 import io
 import re
+import urllib.parse
+import urllib.request
+import json
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, Query, HTTPException
@@ -9,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from kokoro_onnx import Kokoro
 
-app = FastAPI(title="LEPSA Ultra Voice Engine", version="1.0.1")
+app = FastAPI(title="LEPSA Ultra Voice Engine", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,7 +21,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load quantized ONNX Kokoro-82M (~210MB RAM)
 kokoro = Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
 
 def build_custom_voices():
@@ -37,7 +39,6 @@ def build_custom_voices():
 
 CUSTOM_VOICES = build_custom_voices()
 
-# Pre-warm phonemizer once at boot so first request never spikes RAM
 try:
     kokoro.create("Ready.", voice="af_heart", speed=1.0, lang="en-us")
     gc.collect()
@@ -52,15 +53,57 @@ EMOTION_SPEED = {
     "storyteller": 0.94,
 }
 
-# Ultra-lightweight Pure NumPy Studio Mastering (0 extra library RAM)
+# Common Hinglish markers to detect Roman Hindi sentences
+HINGLISH_WORDS = {
+    "hai", "hain", "ho", "hoon", "hu", "tha", "thi", "the", "kya", "kyu", "kyun",
+    "kaise", "kaisa", "kaisi", "kab", "kahan", "kaun", "kis", "ko", "ka", "ki", "ke",
+    "se", "me", "mein", "par", "pe", "aur", "ya", "lekin", "parantu", "magar",
+    "nahi", "nhi", "na", "mat", "haan", "ha", "ji", "namaste", "shukriya", "dhanyavad",
+    "kar", "karo", "karna", "karke", "raha", "rahi", "rahe", "gaya", "gayi", "gaye",
+    "mera", "meri", "mere", "tera", "teri", "tumhara", "aapka", "aapki", "aap", "tum",
+    "main", "hum", "yeh", "ye", "woh", "wo", "ab", "abhi", "bhi", "hi", "toh", "to",
+    "acha", "accha", "theek", "thik", "bahut", "bohot", "jyada", "zyada", "kam",
+    "batao", "bataiye", "sunao", "bolo", "bol", "dekho", "suno", "samajh", "bhai", "dost"
+}
+
+def is_hinglish(text: str) -> bool:
+    if re.search(r"[\u0900-\u097F]", text):
+        return True
+    words = re.findall(r"[a-zA-Z]+", text.lower())
+    if not words:
+        return False
+    hits = sum(1 for w in words if w in HINGLISH_WORDS)
+    return hits >= 2 or (len(words) <= 4 and hits >= 1)
+
+# Zero-RAM Roman Hinglish -> Native Devanagari Transliterator for Authentic Indian Accent
+def hinglish_to_devanagari(text: str) -> str:
+    if re.search(r"[\u0900-\u097F]", text):
+        return text
+    try:
+        encoded = urllib.parse.quote(text)
+        url = f"https://inputtools.google.com/request?text={encoded}&itc=hi-t-i0-und&num=1&cp=0&cs=1&ie=utf-8&oe=utf-8"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data[0] == "SUCCESS":
+                # Reconstruct converted tokens
+                result = text
+                for item in data[1]:
+                    src_word = item[0]
+                    if item[1]:
+                        hi_word = item[1][0]
+                        result = re.sub(r"\b" + re.escape(src_word) + r"\b", hi_word, result, count=1)
+                return result
+    except Exception:
+        pass
+    return text
+
 def master_audio(audio: np.ndarray) -> np.ndarray:
     if len(audio) == 0:
         return audio
-    # Remove DC offset & add subtle presence clarity
     audio = audio - np.mean(audio)
     high_detail = np.diff(audio, prepend=audio[0])
     audio = audio + (0.08 * high_detail)
-
     peak = np.max(np.abs(audio))
     if peak > 0:
         audio = (audio / peak) * 0.89
@@ -73,11 +116,6 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r"[`*_#>~]", "", text)
     text = re.sub(r"https?://\S+", " link ", text)
     return re.sub(r"\s+", " ", text).strip()
-
-def detect_lang(segment: str, default_lang: str) -> str:
-    if re.search(r"[\u0900-\u097F]", segment):
-        return "hi"
-    return default_lang
 
 def resolve_voice(voice_name: str, lang: str):
     if lang == "hi":
@@ -96,11 +134,10 @@ def synthesize_audio(
     emotion: str = "neutral",
     speed: float = 1.0,
 ) -> io.BytesIO:
-    cleaned = clean_markdown(text)[:1500]  # Safe cap per request
+    cleaned = clean_markdown(text)[:1500]
     if not cleaned:
         raise HTTPException(status_code=400, detail="Empty text")
 
-    base_lang = "en-us" if lang in ("auto", "a", "en") else "hi"
     final_speed = speed * EMOTION_SPEED.get(emotion, 1.0)
     sentences = [s.strip() for s in re.split(r"(?<=[.!?।])\s+", cleaned) if s.strip()]
 
@@ -108,11 +145,17 @@ def synthesize_audio(
     short_pause = np.zeros(int(24000 * 0.20), dtype=np.float32)
 
     for sentence in sentences:
-        seg_lang = detect_lang(sentence, base_lang) if lang == "auto" else base_lang
+        if lang == "hi" or (lang == "auto" and is_hinglish(sentence)):
+            seg_lang = "hi"
+            spoken_text = hinglish_to_devanagari(sentence)
+        else:
+            seg_lang = "en-us"
+            spoken_text = sentence
+
         active_voice = resolve_voice(voice, seg_lang)
 
         samples, _ = kokoro.create(
-            sentence,
+            spoken_text,
             voice=active_voice,
             speed=final_speed,
             lang=seg_lang,
@@ -142,8 +185,8 @@ class TTSRequest(BaseModel):
 @app.get("/")
 def health():
     return {
-        "engine": "LEPSA Ultra Voice Engine",
-        "runtime": "Kokoro-82M ONNX Lite (<300MB RAM)",
+        "engine": "LEPSA Ultra Voice Engine v2",
+        "features": ["Auto-Hinglish-to-Devanagari", "Native Indian Hindi Accent", "Custom Brand Voices"],
         "custom_voices": list(CUSTOM_VOICES.keys()),
         "standard_voices": ["af_heart", "am_adam", "bf_emma", "bm_george", "hf_alpha", "hm_omega"],
         "status": "ONLINE",
