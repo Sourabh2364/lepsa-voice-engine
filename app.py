@@ -164,3 +164,54 @@ def tts_get(
     wav_io = synthesize_audio(text, voice, lang, emotion, speed)
     return StreamingResponse(wav_io, media_type="audio/wav")
   
+from fastapi.responses import HTMLResponse
+
+@app.get("/test", response_class=HTMLResponse)
+def test_player():
+    return """
+    <html>
+    <body style="background:#0b0f19;color:#fff;font-family:sans-serif;padding:24px;">
+      <h2>LEPSA Ultra Voice Engine Test</h2>
+      <textarea id="txt" rows="3" style="width:100%;padding:10px;border-radius:8px;">Namaste Saurav, LEPSA Ultra Voice Engine ab live hai!</textarea><br><br>
+      <select id="voice" style="padding:10px;border-radius:8px;">
+        <option value="lepsa_nova">lepsa_nova (Signature Female)</option>
+        <option value="lepsa_titan">lepsa_titan (Signature Male)</option>
+        <option value="hf_alpha">hf_alpha (Hindi Female)</option>
+        <option value="hm_omega">hm_omega (Hindi Male)</option>
+      </select>
+      <button onclick="playVoice()" style="padding:10px 20px;background:#3b82f6;color:#fff;border:none;border-radius:8px;margin-left:8px;">Play Voice</button>
+      <p id="status" style="color:#94a3b8;margin-top:16px;">Ready</p>
+      <audio id="player" controls style="width:100%;margin-top:12px;"></audio>
+      <script>
+        async function playVoice() {
+          const st = document.getElementById('status');
+          st.innerText = 'Generating studio audio...';
+          try {
+            const res = await fetch('/tts', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({
+                text: document.getElementById('txt').value,
+                voice: document.getElementById('voice').value,
+                lang: 'auto'
+              })
+            });
+            if (!res.ok) {
+              st.innerText = 'Error: ' + await res.text();
+              return;
+            }
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const p = document.getElementById('player');
+            p.src = url;
+            p.play();
+            st.innerText = 'Playing!';
+          } catch (e) {
+            st.innerText = 'Failed: ' + e;
+          }
+        }
+      </script>
+    </body>
+    </html>
+    """
+    
